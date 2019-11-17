@@ -1,0 +1,120 @@
+#!/bin/bash
+## May require cut, tr, sed, grep, Bash -ge 4
+## SYANiDE for the shellcoding win!
+
+NARGS=$#
+if [[ $NARGS -lt 1 ]]; then 
+	echo "Quickly objdump ELF sections marked as executable, parse opcodes to various output formats"
+	echo "USAGE: $0 [elf_file] [optional: format] [*objdump args]";
+	echo -e "\tFormats:"
+	echo -e "\t\tah:\tASCII hex (default)"
+	echo -e "\t\toh:\tOCTAL hex, comma separated"
+	echo -e "\t\too:\tOPcodes only"
+	echo -e "\t\tosl:\tOPcodes single line, space separated"
+	echo -e "\t\toslc:\tOPcodes single line compact"
+	echo -e "\t\texec:\tParse right into executor3.elf.  What a shit idea"
+	echo -e "* - must supply format to pass args to objectodump"
+	exit 1;
+fi
+
+function justdump {
+	objdump -d $1 -Mintel $3 $4 $5 $6 $7 $8 $9
+	for item in {1..65}; do echo -n "#"; done
+	echo ""
+	echo "./$0 $*"
+}
+function asciihex {
+	justdump $*
+	ah=$(objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2|\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g'|\
+		grep -Eo "[0-9a-fA-F]{2} "  |\
+		sed -re 's/.*/\\\\x&/g' |\
+		tr -d $'\n' |tr -d ' ')
+	echo -e $ah
+	echo -ne $ah |echo -ne "$(cat -)" |wc -c |echo "$(cat -) bytes"
+}
+function octalhex {
+	justdump $*
+	oh=$(objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2|\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g'|\
+		grep -Eo "[0-9a-fA-F]{2} "  |\
+		sed -re 's/.*/\\\\x&/g' |\
+		tr -d $'\n' |tr -d ' ')
+	echo -e $oh |sed -e 's/\\x/,0x/g' -e 's/^,//g'
+	echo -ne $oh |echo -ne "$(cat -)" |wc -c |echo "$(cat -) bytes"
+}
+function opcodes_only {
+	justdump $*
+	objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2|\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g' -e 's/  .*//g' |\
+		grep -E "[0-9a-fA-F]{2} "
+}
+function opcodes_singleline {
+	justdump $*
+	objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2|\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g' -e 's/  .*//g' |\
+		grep -E "[0-9a-fA-F]{2} " |\
+		tr -d $'\n' |\
+		sed -re 's/[ ]+/ /g'
+		echo
+}
+function opcodes_singleline_compact {
+	justdump $*
+	objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2 |\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g' -e 's/[ ]{2,}.*//g'|\
+		grep -E "[0-9a-fA-F]{2} "  |\
+		sed -re 's/[ ]+$//g' |\
+		tr -d $'\n' |\
+		sed 's/\ //g'
+		echo
+}
+function pass_to_executor3 {
+	justdump $*
+	ah=$(objdump -d $1 $3 $4 $5 $6 $7 $8 $9|\
+		cut -d ':' -f 2|\
+		sed -re 's/\ {2,99}.*/\ /g' -e 's/\t/\ /g'|\
+		grep -Eo "[0-9a-fA-F]{2} "  |\
+		sed -re 's/.*/\\\\x&/g' |\
+		tr -d $'\n' |tr -d ' ')
+	echo -e $ah
+	echo -ne $ah |echo -ne "$(cat -)" |wc -c |echo "$(cat -) bytes"
+	## This is a REALLY shit idea... therefore it's PROD SAUCE
+	DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+	echo -e $ah | $DIR/executor3.elf "$(cat -)" &
+}
+
+
+if [[ $NARGS -eq 2 ]]; then
+	case $2 in
+		ah)
+			asciihex $*
+			;;
+		oh)
+			octalhex $*
+			;;
+		oo)
+			opcodes_only $*
+			;;
+		osl)
+			opcodes_singleline $*
+			;;
+		oslc)
+			opcodes_singleline_compact $*
+			;;
+		exec)
+			pass_to_executor3 $*
+			;;
+		*)
+			asciihex $*
+			;;
+	esac
+else
+	asciihex $*  ## default behavior
+fi
+
+

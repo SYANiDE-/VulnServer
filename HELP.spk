@@ -1,0 +1,3 @@
+s_string("HELP ");
+s_string_variable("A");
+//sleep(3);

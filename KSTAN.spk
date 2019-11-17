@@ -1,0 +1,4 @@
+s_string("KSTAN ");
+s_string_variable("A");
+s_string("\r\n");
+//sleep(3);

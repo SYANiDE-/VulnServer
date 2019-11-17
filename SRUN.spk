@@ -1,0 +1,3 @@
+s_string("SRUN ");
+s_string_variable("A");
+//sleep(3);

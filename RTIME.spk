@@ -1,0 +1,3 @@
+s_string("RTIME ");
+s_string_variable("A");
+//sleep(3);

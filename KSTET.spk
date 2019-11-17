@@ -1,0 +1,3 @@
+s_string("KSTET ");
+s_string_variable("A");
+sleep(1);
