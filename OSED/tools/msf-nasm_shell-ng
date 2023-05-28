@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import sys, readline, pexpect, re, fileinput, os, argparse
+from colorama import Fore
+from IPython import embed
+
+NOTES="""
+Wraps msf-nasm_shell with pexpect to extend nasm_shell with:
+newline delimited commands (already had that capability)
+semicolon delimited commands
+shell loop interactive terminal (retained)
+oneshot piped input
+oneshot cli arg input
+Helpful formatting: oneline c-style hexstring followed by opcode comments
+"""
+
+def get_args():
+	ap = argparse.ArgumentParser(description="msf-nasm_shell next-gen")
+	ap.add_argument("-b","--bitness",default="32",type=str, help="Bitness (32[default]|64)")
+	ap.add_argument("asm", nargs="?", default="", help="Assembly instructions to translate, semicolon (;) or newline (\\n) delimited string.  Can also be piped in instead of passed as an argument.  Oneshot if piped or passed.  Interactive mode if not piped or passed.")
+	AP = ap.parse_args()
+	return AP
+
+
+def format_handler(lines):
+	cmdstr = lines[0]
+	res = lines[1:]
+
+	## ex., list of lists
+	## input: xor ecx, ecx\\ntest ecx, ecx
+	## [['00000000', '31C9', 'xor', 'ecx,ecx'],
+ 	## ['00000002', '85C9', 'test', 'ecx,ecx']]
+	result_piece_lists = [re.sub("\s+"," ", x).split(" ") for x in lines[1:] if len(x) > 0]
+
+	## ex., hexstr
+	## 31c985c9
+	opcodestr = ''.join([x[1] for x in result_piece_lists]).lower()
+
+	## ex., printed: \x31\xc9\x85\xc9
+	cstyle = ''.join([f"\\x{opcodestr[x:x+2].lower()}" for x in range(0,len(opcodestr),2)])
+
+	## ex., # 31C9 xor ecx,ecx; 85C9 test ecx,ecx
+	notes = f"# {'; '.join([' '.join(x[1:]) for x in result_piece_lists])}"
+
+	## ex., "\x31\xc9\x85\xc9"      # 31C9 xor ecx,ecx; 85C9 test ecx,ecx
+	oneline = f"\"{cstyle}\"	{notes} # {int(len(opcodestr)/2)} bytes"
+
+	print(f"\n#[.] {cmdstr}")
+	[print(f"# {x}") for x in lines[1:] if not x == ""]
+	print(f"# {int(len(opcodestr)/2)} bytes\n")
+	print(oneline)
+
+
+def nasm_shell(ns, prompt, asm):
+	if asm == None:
+		return False
+	if asm.rstrip() == "exit":
+		return False
+	ns.sendline(asm.rstrip())
+	ns.expect(prompt)
+	resp = ns.before.decode('utf-8')
+	lines = [x.replace("\r","") for x in resp.split("\n")]
+	format_handler(lines)
+	return True
+
+
+def main():
+	AP = get_args()
+	u_prompt = f"{Fore.LIGHTYELLOW_EX}nasm > {Fore.RESET}"
+	ns_prompt = "\\033\[1mnasm\\033\[0m >"
+	ns = pexpect.spawn(f"msf-nasm_shell {AP.bitness}")
+	ns.expect(ns_prompt)
+	oneshot = 1
+	sep = "\n"
+	while True:
+		## if cli parameter passed:
+		if len(AP.asm) > 0:
+			uin = AP.asm.replace(";",r"\n").rstrip().lstrip()
+		## elif asm passed in as pipe:
+		elif not os.isatty(sys.stdin.fileno()):
+			uin = '\n'.join([x.replace(";",r"\n").rstrip().lstrip() for x in sys.stdin])
+		## else we'll go interactive
+		else:
+			oneshot = 0
+			print(u_prompt, end='')
+			uin = input().replace(";",r"\n").rstrip().lstrip()
+		if nasm_shell(ns, ns_prompt, uin) == False or oneshot == 1:
+			break
+
+if __name__=="__main__":
+	main()
+

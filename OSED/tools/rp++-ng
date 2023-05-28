@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+import os, sys, re, argparse, subprocess, shlex, binascii
+from struct import pack, unpack
+from colorama import Fore, Back
+from cpick import pick
+# from IPython import embed
+
+## ./rp++-ng -f msvcrt.dll --va 0x0 -r 5  -b "\x0a\x0d" --addbase 0x073310000 --unique --sort -l
+## ./rp++-ng -g msvcrt_curatedgadgets.txt
+
+
+def get_args():
+    ap = argparse.ArgumentParser(description="rp++ wrapper, gadget finder")
+    group_interactive = ap.add_argument_group("Interactivity options")
+    group_interactive.add_argument('--interactive', '-i', action='store_false', default=True, help="DISABLE use of ncurses interactive gadget selector.")
+    group_interactive.add_argument('--number', '-n', action='store_true', default=False, help="ENABLE line numbering in ncurses interactive gadget selector.")
+    group1 = ap.add_mutually_exclusive_group(required=True)
+    group1.add_argument('--file', '-f', type=str, help="DLL to parse")
+    group1.add_argument('--gadgetfile', '-g', type=str, help='rp++ gadgets output file as input.')
+    group_rplus = ap.add_argument_group("rp++ exclusive options")
+    group_rplus.add_argument('--va', '-v', type=str, required="--file" in sys.argv or False, help='Virtual Address (rebase output)')
+    ap.add_argument('--addbase', '-a', type=str, help='Add a baseaddr to line addresses before searching for badchars.  Note line output retains --va basing (or original basing if read from existing file).')
+    group_rplus.add_argument('--roplen', '-r', type=int, required="--file" in sys.argv or False, help='Limit gadget instruction count to (this) upper bound')
+    ap.add_argument('--badchars', '-b', type=str, default='', help="Prune gadgets with instructions containing any [these] badchars")
+    ap.add_argument('--prepend', '-p', action='store_true', default=False, help="Prepend lines with '[base_filename]+[address],# ' ")
+    group2 = ap.add_mutually_exclusive_group(required=False)
+    group2.add_argument('--regex', '-R', type=str, default=None, help="Arbitrary REGEX line pattern (one-off search)")
+    ap.add_argument('--sort', '-s', action='store_true', default=False, help="Sort gadgets by length")
+    ap.add_argument('--unique', '-u', action='store_true', default=False, help="remove duplicate gadgets")
+    group2.add_argument('--loose', '-l', action='store_true', default=False, help="Go through the loose idioms (WARN: much wider net!!! Suggested to use a lower --roplen)")
+    ap.add_argument('--matches', '-m', nargs='+', default=[], help="Colorize --regex lines by --match patterns, space-separated list of pattern strings.  If supplied, this MUST be the last argument.")
+    AP, garbage = ap.parse_known_args()
+    AP = vars(AP)
+    if type(AP['gadgetfile']) == str:
+        va = not "NoneType" in str(type(AP['va']))
+        roplen = not "NoneType" in str(type(AP['roplen']))
+        if va or roplen: 
+            print("--gadgetfile incompatible with --va or --roplen (the lines in the infile are already set in stone).\nHowever, --addbase can still be used here when filtering out lines containing badchars (add addbase to existing gadget address then filter out the gadget if address contains any --badchars)")
+            sys.exit()
+    return AP
+
+
+def uniesc_to_bytestr(instring):
+    r""" '\\x58\\x59\\x5a\\xa0' -> 'XYZ\xa0' 
+        hexstrings in from cli, ex., argparse   """
+    return bytes(instring, 'utf-8').decode("unicode_escape")
+
+def bytestr_to_long(inbstr):
+    r""" 'XYZ\xa0' -> 2690275672 """
+    return unpack("I",bytes(inbstr,'latin-1'))[0]
+
+def long_to_bytestr(inlong):
+    r""" 2690275672 -> 'XYZ\xa0' """
+    return pack("<L", inlong).decode('latin-1')
+
+def octalstring_to_bytestr_pad(inoct):
+    r""" "0x200" -> '\x00\x02\x00\x00' (le) 
+        for the --va + --addbase scenario 
+        pad with \x00 to dword size bytes """
+    return pack("<L", (int(inoct,16))).decode('latin-1')
+
+def octalstring_to_bytestr_nopad(inoct):
+    r""" "0x200" -> '\x00\x02' (le) 
+        for the --va only scenario 
+        no padding with \x00 to dword size bytes """
+    octstr = inoct[2:]
+    if len(octstr) % 2 == 1:
+        octstr = f"0{octstr}"
+    return ''.join([chr(int(octstr[x:x+2],16)) for x in range(0,len(octstr),2)][::-1])
+
+def add_octalstr_base_to_va__out_bytestr(addr, base):
+    a = octalstring_to_bytestr_pad(addr)
+    b = octalstring_to_bytestr_pad(base)
+    c = (bytestr_to_long(a) + bytestr_to_long(b)) & 0xffffffff
+    return long_to_bytestr(c)
+
+def cli_regex_to_idiom(regex,matches):
+    key = uniesc_to_bytestr(regex)
+    try:
+        value = [uniesc_to_bytestr(x) for x in matches]
+        assert len(value) > 0
+    except:
+        value = ['NO COLORIZE']
+    IDIOM = [{ key : value }]
+    return IDIOM
+
+def no_badchars_in_line(bads, line, addbase=None, address_pat=None):
+    pat = address_pat if not address_pat == None else re.compile('^.{2,10}:')
+    addr = re.findall(pat, line)[0][:-1]
+    if not addbase == None:
+        addr = add_octalstr_base_to_va__out_bytestr(addr, addbase)
+    else:
+        addr = octalstring_to_bytestr_nopad(addr)
+    bads = uniesc_to_bytestr(bads)
+    if len(bads) > 0:
+        if len([x for x in addr if x in bads]) > 0:
+            return False
+        else:
+            return True
+    else:
+        return True
+
+def collapse_multispace(line):
+    while (" " * 2) in line:
+        line = line.replace(" " * 2, " ")
+    return line
+
+def remove_duplicate_gadgets(gadgetlist):
+    analyzed = []
+    newgadgetlist = []
+    for gadget in gadgetlist:
+        theactualgadget = ':'.join(gadget.split(":")[1:])
+        if not theactualgadget in analyzed:
+            analyzed.append(theactualgadget)
+            newgadgetlist.append(gadget)
+    return newgadgetlist
+
+def rp_plus_plus(args):
+    CMD = shlex.split(f"rp++ -f {args['file']} -r {args['roplen']} --va {args['va']}")
+    textlist = str(subprocess.check_output(CMD, shell=False, stderr=subprocess.STDOUT).decode('latin-1')).split("\n")
+    pat = re.compile('\(\d+ found\)')
+    curated_gadgets = [re.sub(pat,'', collapse_multispace(line)) for line in textlist if ':' in line and '0x' in line and no_badchars_in_line(args['badchars'], line, args['addbase'], re.compile('^.{2,10}:')) == True ]
+    if args['sort'] == True:
+        return sorted(curated_gadgets,key=len)
+    else:
+        return curated_gadgets
+
+def gadgetfile_in(args):
+    with open(args['gadgetfile'],'r') as F:
+        textlist = F.read().split("\n")
+        F.close()
+    pat = re.compile('\(\d+ found\)')
+    curated_gadgets = [re.sub(pat,'', collapse_multispace(line)) for line in textlist if ':' in line and '0x' in line and no_badchars_in_line(args['badchars'], line, args['addbase'], re.compile('^.{2,10}:')) == True ]
+    if args['sort'] == True:
+        return sorted(curated_gadgets,key=len)
+    else:
+        return curated_gadgets
+
+def outfile_writer(ARGS, gadgets, verb):
+    thefile = ARGS['file'] or ARGS['gadgetfile']
+    filename = thefile.replace("./","").split("/")[-1].split(".")[0]
+    outfile_name = f"{filename}_{verb}gadgets.txt"
+    with open(outfile_name,'w') as F:
+        F.write('\n'.join(gadgets))
+        F.close()
+    print(f"[+] {verb} gadget list saved to {outfile_name}")
+
+def post_process(matches,theline):
+    for matchset in matches:
+        for match in matchset:
+            newline = theline.replace(match, f"{Fore.LIGHTRED_EX}{match}{Fore.RESET}")
+            theline = newline
+        return theline
+
+def do_prepend_line(ARGS, line):
+    if ARGS['prepend'] == True:
+        thefile = ARGS['file'] or ARGS['gadgetfile']
+        filename = thefile.replace("./","").split("/")[-1].split(".")[0]
+        line_components = line.split(":")
+        address = line_components[0]
+        remainder = ':'.join(line_components[1:])
+        theline = f"{filename}+{address},#:{remainder}"
+    else:
+        theline = line
+    return theline
+
+def filter_gadgets(ARGS, gadgets, linepat, subpats,postprocess=0):
+    gadgetlist = []
+    for line in gadgets:
+        found_badwords = [word for word in BAD_WORDS if word in line]
+        linematch = re.findall(linepat, line)
+        if len(linematch) > 0 and len(found_badwords) == 0:
+            theline = line
+            matches = [re.findall(pat, theline) for pat in subpats]
+            if len(matches) > 0:
+                if postprocess == 1:
+                    theline = post_process(matches, theline)
+            gadgetlist.append(theline)
+    return gadgetlist
+
+def result_handler(ARGS, RESULTS, addl_verb):
+    TO_OUTFILE = []
+    # embed(); sys.exit()
+    for idiom, result in RESULTS.items():
+        header = f"\n\n######## {idiom} ########"
+        outfile_results = result['selected']
+        printable_results = result['printable']
+        TO_OUTFILE.append(header)
+        for item in outfile_results:
+            TO_OUTFILE.append(item)
+        print(header)
+        for item in printable_results:
+            print(item)
+    if not len(RESULTS) == 0:
+        outfile_writer(ARGS, TO_OUTFILE, f'{addl_verb}selected')
+
+
+def idiom_iter_interactive(ARGS, gadgets, TARGET_IDIOMS):
+    RESULTS = {}
+    for inum, idiom in enumerate(TARGET_IDIOMS):
+        for k,v in idiom.items():
+            linepat = re.compile(k)
+            subpats = [re.compile(x) for x in v]
+            title = f"[+] REGEX: [{k}]"
+            gadgetlist = filter_gadgets(ARGS,gadgets, linepat, subpats,postprocess=0)
+            print(f"{title} : {len(gadgetlist)} results")
+            kwargs = {
+                "items": gadgetlist,
+                'numbers': ARGS['number'],
+                'header': title,
+            }
+            try:
+                selected = pick(**kwargs)  ## cpick lib
+            except KeyboardInterrupt:
+                sys.exit()
+            except Exception as X:
+                selected = []
+                pass
+            printable = []
+            for theline in selected:
+                matches = [re.findall(pat, theline) for pat in subpats]
+                printable.append(do_prepend_line(ARGS,post_process(matches, theline)))
+            RESULTS[k] = {'selected': selected, 'printable': printable}
+    return RESULTS
+
+
+def idiom_iter(ARGS, gadgets, IDIOM, NEXTIDIOM=None):
+    for k,v in IDIOM.items():
+        linepat = re.compile(k)
+        subpats = [re.compile(x) for x in v]
+        print(f"\n\n\n#### REGEX: {k} ####")
+        gadgetlist = filter_gadgets(ARGS, gadgets, linepat, subpats, postprocess=1)
+        for gad in gadgetlist:
+            print(do_prepend_line(ARGS,gad)) 
+        resp = "XXX"
+        print(f"""\n[=] CURR REGEX:\t\t{str(IDIOM.keys()).split(r"'")[1]} """)
+        if not NEXTIDIOM == None:
+            print(f"""[=] NEXT REGEX:\t\t{str(NEXTIDIOM.keys()).split(r"'")[1]} """)
+            while not resp in ['n','q']:
+                resp = input("[:] PAUSED: (n)ext idiom, (q)uit\n>: ").rstrip("\n")
+        else:
+            print(f"""[=] NEXT REGEX:\t\tNONE """)
+            while not resp in ['q']:
+                resp = input("[:] PAUSED: (q)uit\n>: ").rstrip("\n")
+        if resp == "n":
+            return
+        if resp == "q":
+            sys.exit()
+
+
+_g = f"{Fore.LIGHTGREEN_EX}"
+_y = f"{Fore.LIGHTYELLOW_EX}"
+_b = f"{Fore.LIGHTBLUE_EX}"
+_r = f"{Fore.LIGHTRED_EX}"
+_R = f"{Fore.RESET}"
+name = f"{_g}rp++-ng{_R}"
+author=f"{_g}SYANiDE{_R}"
+BANNER=f"""
+  {name}{_r}?{_R}                           {_r}^^{_R}           
+             {_y}_________{_R} {_y}_________{_R}      {_y}___{_R} {_y}__{_R}  {_y}__________{_R} {_r}`{_R}
+   {_r}.{_R}       {_y}|{_R}    {_y}_o___|{_R}    {_y}_o___ ++-{_R} {_y}|{_R}   {_y}\{_R}  {_y}|/{_R}   {_y}/_____/{_R}  {_r}!{_R}
+          {_y}|___|\____|___|{_b}%%%%%{_R}     {_y}|____\_|\___\____.]{_R} 
+  {_r}z{_R}        {_b}`BB'{_R} {_b}`BBB'`B'{_R}           {_b}`BBBBBBB'{_R} {_b}`BBBBBBBB'{_R} 
+    {_r} ;{_R}                                    {_y}Chain{_R} {_y}faster{_R}
+              {_r}[[{_R}                            {_b}$$$$${_R} {_b}$$$$$${_R}      {_r}i{_R}
+                    {_r}+{_R}                                    {author}
+        
+"""
+
+def main():
+    print(BANNER)
+    ARGS = get_args()
+    if not ARGS['addbase'] == None:
+        print(f"[+] Adding baseaddr to --va offsets before filtering for badchars")
+    if not ARGS['file'] == None:
+        clean_gadgets = rp_plus_plus(ARGS)
+    if not ARGS['gadgetfile'] == None:
+        clean_gadgets = gadgetfile_in(ARGS)
+    if ARGS['unique'] == True:
+        clean_gadgets = remove_duplicate_gadgets(clean_gadgets)
+        print("[+] Pruned gadgets to unique occurrences")
+    outfile_writer(ARGS, clean_gadgets, "curated" if type(ARGS['file']) == str else "recycled" if type(ARGS['gadgetfile']) == str else "" )
+    # embed()
+    TARGET_IDIOMS = IDIOMS
+    addl_verb = "specific-"
+    if type(ARGS['regex']) == str:
+        TARGET_IDIOMS = cli_regex_to_idiom(ARGS['regex'],ARGS['matches'])
+        addl_verb = "regex-"
+    if ARGS['loose'] == True:
+        TARGET_IDIOMS = LOOSE_IDIOMS  ## use the loose idioms instead
+        addl_verb = "loose-"
+    if ARGS['interactive'] == True:
+        RESULTS = idiom_iter_interactive(ARGS,clean_gadgets, TARGET_IDIOMS)
+        result_handler(ARGS,RESULTS, addl_verb)
+    else:
+        for inum, idiom in enumerate(TARGET_IDIOMS):
+            try:
+                idiom_iter(ARGS, clean_gadgets, TARGET_IDIOMS[inum], TARGET_IDIOMS[inum+1])
+            except IndexError:
+                idiom_iter(ARGS, clean_gadgets, TARGET_IDIOMS[inum], None)
+
+
+'''
+[
+    string regex pat : [ list of regex pats to colorize ]
+]
+'''
+IDIOMS = [
+    {': jmp ... ' :                             ['jmp ... ']},
+    {': call ... ' :                            ['call ... ']},
+    {': push ... ; ret' : ['push ... ']},
+    {': push ... .* pop ... .* ret' : ['push ... ', 'pop ... ']},
+    {': pop ... ; ret' : ['pop ... ']},
+    {': neg ... ; ret' : ['neg ... ']},
+    {': not ... ; ret' : ['not ... ']},
+    {': inc ... ; ret' : ['inc ... ']},
+    {': inc \[...\] ; ret' : ['inc \[...\] ']},
+    {': dec ... ; ret' : ['dec ... ']},
+    {': dec \[...\] ; ret' : ['dec \[...\] ']},
+    {': add ..., ... ; ret': ['add ..., ... ']},
+    {': add ..., \[...\] ; ret': ['add ..., \[...\]']},
+    {': add \[...\], ... ; ret': ['add \[...\], ...']},
+    {': sub ..., ... ; ret': ['sub ..., ... ']},
+    {': sub ..., \[...\] ; ret': ['sub ..., \[...\]']},
+    {': sub \[...\], ... ; ret': ['sub \[...\], ...']},
+    {': mov ..., ... ; ret': ['mov ..., ... ']},
+    {': mov ..., \[...\] ; ret': ['mov ..., \[...\]']},
+    {': mov \[...\], ... ; ret': ['mov \[...\], ...']},
+    {': xchg ..., ... ; ret': ['xchg ..., ... ']},
+    {': xchg ..., \[...\] ; ret': ['xchg ..., \[...\]']},
+    {': xchg \[...\], ... ; ret': ['xchg \[...\], ...']},
+    {': xor ..., ... ; ret': ['xor ..., ... ']},
+    {': xor ..., \[...\] ; ret': ['xor ..., \[...\]']},
+    {': xor \[...\], ... ; ret': ['xor \[...\], ...']},
+    {': and ..., ... ; ret': ['and ..., ... ']},
+    {': and ..., \[...\] ; ret': ['and ..., \[...\]']},
+    {': and \[...\], ... ; ret': ['and \[...\], ...']},
+    {': or ..., ... ; ret': ['or ..., ... ']},
+    {': or ..., \[...\] ; ret': ['or ..., \[...\]']},
+    {': or \[...\], ... ; ret': ['or \[...\], ...']},
+]
+
+
+LOOSE_IDIOMS = [
+    {': jmp ... ' :                             ['jmp ... ']},
+    {': call ... ' :                            ['call ... ']},
+    {': xor ..., ... .* ret' :                  ['xor ..., ... ']},
+    {': xor ..., \[...\] .* ret' :              ['xor ..., \[...\]']},
+    {': xor \[...\], ... .* ret' :              ['xor \[...\], ...']},
+    {': push ... .* ret' :                      ['push ... ']},
+    {': pop ... .* ret' :                       ['pop ... ']},
+    {': xchg ..., ... .* ret' :                 ['xchg ..., ... ']},
+    {': xchg ..., \[...\] .* ret' :             ['xchg ..., \[...\]']},
+    {': xchg \[...\], ... .* ret' :             ['xchg \[...\], ...']},
+    {': xchg ..., \[...(\+|-).{1,10}\] .* ret' :['xchg ..., \[...(\+|-).{1,10}\]']},
+    {': xchg \[...(\+|-).{1,10}\], ... .* ret' :['xchg \[...(\+|-).{1,10}\], ...']},
+    {': xchg ..., \[...(\+|-)...(\+|-).{1,10}\] .* ret' :['xchg ...,\[...(\+|-)...(\+|-).{1,10}\]']},
+    {': xchg \[...(\+|-)...(\+|-).{1,10}\], ... .* ret' :['xchg \[...(\+|-)...(\+|-).{1,10}\], ...']},
+    {': mov ..., ... .* ret' :                  ['mov ..., ... ']},
+    {': mov ..., \[...\] .* ret' :              ['mov ..., \[...\]']},
+    {': mov \[...\], ... .* ret' :              ['mov \[...\], ...']},
+    {': mov ..., \[...(\+|-).{1,10}\] .* ret' : ['mov ..., \[...(\+|-).{1,10}\]']},
+    {': mov \[...(\+|-).{1,10}\], ... .* ret' : ['mov \[...(\+|-).{1,10}\], ...']},
+    {': mov ..., \[...(\+|-)...(\+|-).{1,10}\] .* ret' : ['mov ..., \[...(\+|-)...(\+|-).{1,10}\]']},
+    {': mov \[...(\+|-)...(\+|-).{1,10}\], ... .* ret' : ['mov \[...(\+|-)...(\+|-).{1,10}\], ...']},
+    {': inc ... .* ret' :                       ['inc ... ']},
+    {': inc \[...\] .* ret' :                   ['inc \[...\] ']},
+    {': dec ... .* ret' :                       ['dec ... ']},
+    {': dec \[...\] .* ret' :                   ['dec \[...\] ']},
+    {': add ..., ... .* ret' :                  ['add ..., ... ']},
+    {': add ..., \[...\] .* ret' :              ['add ..., \[...\]']},
+    {': add \[...\], ... .* ret' :              ['add \[...\], ...']},
+    {': sub ..., ... .* ret' :                  ['sub ..., ... ']},
+    {': sub ..., \[...\] .* ret' :              ['sub ..., \[...\]']},
+    {': sub \[...\], ... .* ret' :              ['sub \[...\], ...']},
+    {': and ..., ... .* ret' :                  ['and ..., ... ']},
+    {': and ..., \[...\] .* ret' :              ['and ..., \[...\]']},
+    {': and \[...\], ... .* ret' :              ['and \[...\], ...']},
+    {': or ..., ... .* ret' :                   ['or ..., ... ']},
+    {': or ..., \[...\] .* ret' :               ['or ..., \[...\]']},
+    {': or \[...\], ... .* ret' :               ['or \[...\], ...']},
+    {': neg ... .* ret' :                       ['neg ... ']},
+    {': not ... .* ret' :                       ['not ... ']},
+    {': push ... .* pop ... .* ret' :           ['push ... ', 'pop ... ']},
+    {': push ... .* mov ..., \[esp\] .* ret' :  ['push ... ', 'mov ..., \[esp\]']},
+    {': push ... .* xchg ..., \[esp\] .* ret' : ['push ... ', 'xchg ..., \[esp\]']},
+]
+
+BAD_WORDS = [
+    "clts", "hlt", "lmsw", "ltr", "lgdt", "lidt" ,"lldt", "mov cr", "mov dr",
+    "mov tr", "in ", "ins", "invlpg", "invd", "out", "outs", "cli", "sti",
+    "popf", "pushf", "int", "iret", "iretd", "swapgs", "wbinvd",
+    "leave", "lock", "enter", "wait", "???"
+]
+
+if __name__=='__main__':
+    main() 

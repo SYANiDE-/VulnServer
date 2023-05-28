@@ -1,0 +1,34 @@
+
+### setting up symbol server
+### First path is for one-off or other symbols, second is for MS symbol server + cached to 
+.sympath C:\symbolsextra;srv*C:\symbols*https://msdl.microsoft.com/download/symbols
+
+.reload /f
+
+We can set WinDBG to permanently use these paths by setting the environment variables:
+_NT_ALT_SYMBOL_PATH=c:\symbolsextra
+_NT_SYMBOL_PATH=srv*C:\symbols*https://msdl.microsoft.com/download/symbols
+
+### Narly DLLs
+https://code.google.com/archive/p/narly/downloads
+https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/narly/narly_0.2a.zip
+### Need to install it/them to:
+C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\winext
+C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\winext
+
+### Stanzas ###
+
+### A watchdog process webvkeep restarts the webvrpcs.exe after an amount of hung time.  The following unsuspends the process, waits for webvrpcs.exe to be running, attaches a debugger to it, and suspends webvkeep to keep it from killing off hung/debugging webvrpcs
+c:\tools\SysinternalsSuite\pssuspend.exe -accepteula -nobanner -r webvkeep & timeout 3 & powershell -exec bypass -c "$x = get-process -name webvrpcs; while ($x -eq $null) { start-sleep -seconds 1; $x = get-process -name webvrpcs }" & "C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\windbg.exe" -WF C:\windbg_custom.WEW -pn webvrpcs.exe -c 'bp msvcrt+0x3385c; g' & timeout 5 & c:\tools\SysinternalsSuite\pssuspend.exe -nobanner webvkeep
+
+### A service runs the binary to be debugged
+((sc.exe stop "Sync Breeze Enterprise" & timeout 3 & sc.exe start "Sync Breeze Enterprise") | sc.exe start "Sync Breeze Enterprise" ) & timeout 3 & "C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\windbg.exe" -WF C:\windbg_custom.WEW -pn syncbrs.exe -c 'bp 0x10131de4; bp 0x1012d3ce "dd edx-0x1c"; g'
+
+### Real basic, something tries to keep it running if not already running
+"C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\windbg.exe" -WF C:\windbg_custom.WEW -pn tftpserver.exe -c 'bp 0040A84E "gc"; bp 0x12074482; g'
+
+### Might have to start/stop the binary yourself
+((cmd.exe /c "taskkill /F /IM FastBackServer.exe" && timeout 3 && "C:\Program Files\Tivoli\TSM\FastBack\server\FastBackServer.exe") || "C:\Program Files\Tivoli\TSM\FastBack\server\FastBackServer.exe") && timeout 3 && "C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\windbg.exe" -WF C:\windbg_custom.WEW -pn FastBackServer.exe -c "bp wsock32!recv; g; dds @esp L0x5; bc *;bp FastBackServer!FXCLI_OraBR_Exec_Command+0x375; g"
+
+### Application blocks while running, and has terminal output.
+((cmd.exe /c "taskkill /F /IM main.exe" && timeout 3 && START /B "" "C:\users\admin\desktop\current_thing\main_aslr_dep.exe" > c:\users\admin\desktop\current_thing\output.txt) || START /B "" "C:\users\admin\desktop\current_thing\main_aslr_dep.exe" > c:\users\admin\desktop\current_thing\output.txt) && timeout 3 && "C:\Program Files (x86)\Windows Kits\10\Debuggers\x86\windbg.exe" -WF C:\windbg_custom.WEW -pn main_aslr_dep.exe -c 'bp msvcrt+0xfad5; g'

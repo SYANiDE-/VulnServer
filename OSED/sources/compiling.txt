@@ -1,0 +1,7 @@
+gcc.exe -c essfunc.c
+gcc.exe -shared -o essfunc.dll -Wl,--out-implib=libessfunc.a -Wl,--image-base=0x62500000 essfunc.o
+
+gcc.exe vulnserver.c -o vulnserver.exe -lws2_32 ./libessfunc.a
+gcc.exe vulnserver.c -o vulnserver_aslr.exe -lws2_32 ./libessfunc.a -Wl,--dynamicrebase
+gcc.exe vulnserver.c -o vulnserver_dep.exe -lws2_32 ./libessfunc.a -wl,--nxcompat
+gcc.exe vulnserver.c -o vulnserver_aslr_dep.exe -lws2_32 ./libessfunc.a -Wl,--dynamicrebase,--nxcompat
